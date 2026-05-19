@@ -158,7 +158,7 @@ func matchFile(path, extRule, keyRule string) bool {
 
 	// 1. 校验后缀名规则（如果留空，直接跳过此项检测，进入关键字匹配）
 	if extRule != "" {
-		if strings.ToLower(filepath.Ext(path)) != strings.ToLower(extRule) {
+		if !strings.EqualFold(filepath.Ext(path), extRule) {
 			return false
 		}
 	}
