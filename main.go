@@ -3,166 +3,204 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+)
+
+// 终端 ANSI 颜色常量
+const (
+	ColorBlue   = "\033[1;34m"
+	ColorGreen  = "\033[1;32m"
+	ColorWhite  = "\033[1;37m"
+	ColorReset  = "\033[0m"
+	ClearScreen = "\033[H\033[2J" // 物理清屏并复位光标
 )
 
 func main() {
-	// 使用 bufio.Reader 确保可以完整读取带空格的路径或字符串
-	reader := bufio.NewReader(os.Stdin)
+	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
+		// 1. 物理清屏，确保每一次“重来”都是干净的头部界面
+		fmt.Print(ClearScreen)
+
+		// 2. 蓝色大标题及外框
 		fmt.Println("\033[36m+------------------------------------------+\033[0m")
-		fmt.Println("\033[36m|                文件提取工具              |\033[0m")
+		fmt.Println("\033[36m|               文件提取工具               |\033[0m")
 		fmt.Println("\033[36m+------------------------------------------+\033[0m")
-		fmt.Println("请拖入【单个/多个 文件/文件夹】并按回车:")
-		fmt.Print("\033[32m>> \033[0m")
 
-		// 1. 输入源目录
-		fmt.Print("1. 请输入来源目录 (多个目录请用逗号 [,] 分隔):\n-> ")
-		srcInput, _ := reader.ReadString('\n')
-		srcInput = strings.TrimSpace(srcInput)
-		if srcInput == "" {
-			fmt.Println("[错误] 来源目录不能为空，请重新开始。")
+		// 3. 输入源路径（支持多个文件夹/文件拖入）
+		fmt.Printf("%s[1] 请拖入【单个/多个 文件夹】并按回车:%s\n-> ", ColorWhite, ColorReset)
+		if !scanner.Scan() {
+			break
+		}
+		rawPaths := scanner.Text()
+		targets := parseDragPaths(rawPaths)
+		if len(targets) == 0 {
+			fmt.Println("未检测到有效路径，请重试。")
+			waitForRestart(scanner)
 			continue
 		}
 
-		// 2. 输入目标后缀
-		fmt.Print("2. 请输入要提取的后缀名 (例如 .mp4 或 .mp4,.mkv , 留空默认 .mp4):\n-> ")
-		extInput, _ := reader.ReadString('\n')
-		extInput = strings.TrimSpace(extInput)
-		if extInput == "" {
-			extInput = ".mp4"
+		// 4. 输入目标输出目录
+		fmt.Printf("\n%s[2] 请拖入或输入【提取后存放】的目标文件夹路径:%s\n-> ", ColorWhite, ColorReset)
+		if !scanner.Scan() {
+			break
+		}
+		outDir := strings.Trim(scanner.Text(), ` "`)
+
+		// 5. 输入后缀名规则（留空默认）
+		fmt.Printf("\n%s[3] 请输入要提取的【后缀名】(留空默认不限后缀):%s\n-> ", ColorWhite, ColorReset)
+		if !scanner.Scan() {
+			break
+		}
+		extRule := strings.TrimSpace(scanner.Text())
+		if extRule != "" && !strings.HasPrefix(extRule, ".") {
+			extRule = "." + extRule
 		}
 
-		// 3. 输入关键字
-		fmt.Print("3. 请输入文件名必须包含的关键字 (不需要请直接回车留空):\n-> ")
-		matchInput, _ := reader.ReadString('\n')
-		matchInput = strings.TrimSpace(matchInput)
+		// 6. 输入关键字规则
+		fmt.Printf("\n%s[4] 请输入要检索的【文件名关键字】(留空默认匹配所有):%s\n-> ", ColorWhite, ColorReset)
+		if !scanner.Scan() {
+			break
+		}
+		keyRule := strings.TrimSpace(scanner.Text())
 
-		// 4. 输入导出目录
-		fmt.Print("4. 请输入导出目标目录:\n-> ")
-		outInput, _ := reader.ReadString('\n')
-		outInput = strings.TrimSpace(outInput)
-		if outInput == "" {
-			fmt.Println("[错误] 导出目录不能为空，请重新开始。")
+		// 7. 执行物理扫描与提取工作
+		fmt.Printf("\n%s正在建立检索索引，开始执行物理提取...%s\n", ColorBlue, ColorReset)
+		executeExtract(targets, outDir, extRule, keyRule)
+
+		// 8. 按下回车清空当前屏幕并重来（已修正为绿色提示）
+		fmt.Printf("\n%s[ 任务结束 ] 按回车键 (Enter) 重新开始...%s\n", ColorGreen, ColorReset)
+		waitForRestart(scanner)
+	}
+}
+
+// 解析拖拽进终端的路径（智能处理双引号与空格隔离的多路径）
+func parseDragPaths(raw string) []string {
+	var paths []string
+	var sb strings.Builder
+	inQuotes := false
+
+	// 遍历解析拖入的路径字符串，兼容物理拖拽的引号闭合机制
+	for i := 0; i < len(raw); i++ {
+		char := raw[i]
+		if char == '"' {
+			inQuotes = !inQuotes
 			continue
 		}
-
-		// 参数解析准备
-		srcDirs := strings.Split(srcInput, ",")
-		outDir := filepath.Clean(outInput)
-
-		rawExts := strings.Split(extInput, ",")
-		extMap := make(map[string]bool)
-		for _, e := range rawExts {
-			extMap[strings.ToLower(strings.TrimSpace(e))] = true
-		}
-
-		// 创建目标目录
-		if err := os.MkdirAll(outDir, 0755); err != nil {
-			fmt.Printf("[错误] 创建目标目录失败: %v\n", err)
-			continue
-		}
-
-		fmt.Println("\n正在执行提取，请稍候...")
-		startTime := time.Now()
-		totalCopied := 0
-		totalFailed := 0
-
-		// 5. 核心遍历与提取逻辑
-		for _, srcDir := range srcDirs {
-			srcDir = strings.TrimSpace(srcDir)
-			if srcDir == "" {
-				continue
+		if char == ' ' && !inQuotes {
+			if sb.Len() > 0 {
+				paths = append(paths, sb.String())
+				sb.Reset()
 			}
+			continue
+		}
+		sb.WriteByte(char)
+	}
+	if sb.Len() > 0 {
+		paths = append(paths, sb.String())
+	}
+	return paths
+}
 
-			// 检查源目录是否存在
-			if _, err := os.Stat(srcDir); os.IsNotExist(err) {
-				fmt.Printf("[跳过] 目录不存在: %s\n", srcDir)
-				continue
+// 执行核心文件搜索与物理拷贝
+func executeExtract(targets []string, outDir, extRule, keyRule string) {
+	// 创建输出目录
+	if err := os.MkdirAll(outDir, os.ModePerm); err != nil {
+		fmt.Printf("创建目标文件夹失败: %v\n", err)
+		return
+	}
+
+	successCount := 0
+
+	for _, target := range targets {
+		info, err := os.Stat(target)
+		if err != nil {
+			fmt.Printf("路径无效，跳过: %s\n", target)
+			continue
+		}
+
+		// 情况 A: 拖入的是单个文件
+		if !info.IsDir() {
+			if matchFile(target, extRule, keyRule) {
+				if copyFile(target, filepath.Join(outDir, info.Name())) {
+					successCount++
+				}
 			}
+			continue
+		}
 
-			_ = filepath.WalkDir(srcDir, func(path string, d os.DirEntry, err error) error {
-				if err != nil {
-					return nil // 遇到权限等错误的子目录直接跳过，不中断整个任务
-				}
-				if d.IsDir() {
-					return nil
-				}
-
-				filename := d.Name()
-				fileExt := strings.ToLower(filepath.Ext(filename))
-
-				// 后缀过滤
-				if !extMap[fileExt] {
-					return nil
-				}
-
-				// 关键字过滤
-				if matchInput != "" && !strings.Contains(filename, matchInput) {
-					return nil
-				}
-
-				// 执行复制
-				destPath := generateDestPath(outDir, filename)
-				if err := copyFile(path, destPath); err != nil {
-					fmt.Printf("[失败] %s -> %v\n", filename, err)
-					totalFailed++
-				} else {
-					fmt.Printf("[成功] %s\n", filename)
-					totalCopied++
-				}
+		// 情况 B: 拖入的是文件夹，执行深度递归扫描
+		err = filepath.WalkDir(target, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
 				return nil
-			})
+			}
+			if matchFile(path, extRule, keyRule) {
+				if copyFile(path, filepath.Join(outDir, d.Name())) {
+					successCount++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("扫描文件夹 [%s] 出错: %v\n", target, err)
 		}
-
-		// 6. 给出统计结果
-		duration := time.Since(startTime).Round(time.Millisecond)
-		fmt.Println("\n====== 任务执行完毕 ======")
-		fmt.Printf("总计耗时: %v\n", duration)
-		fmt.Printf("成功提取: %d 个文件\n", totalCopied)
-		if totalFailed > 0 {
-			fmt.Printf("提取失败: %d 个文件\n", totalFailed)
-		}
-		fmt.Println("==========================")
-
-		// 7. 阻断并等待回车继续
-		fmt.Print("\n[提示] 按 [回车键(Enter)] 可以继续下一次运行...")
-		_, _ = reader.ReadString('\n')
 	}
+
+	fmt.Printf("\n%s提取完成！成功物理复制了 %d 个文件到目标目录。%s\n", ColorGreen, successCount, ColorReset)
 }
 
-// copyFile 实现底层文件流复制
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
+// 核心过滤规则判断：后缀名与关键字
+func matchFile(path, extRule, keyRule string) bool {
+	filename := filepath.Base(path)
 
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
+	// 1. 校验后缀名规则（如果留空，直接跳过此项检测，进入关键字匹配）
+	if extRule != "" {
+		if strings.ToLower(filepath.Ext(path)) != strings.ToLower(extRule) {
+			return false
+		}
 	}
-	defer destFile.Close()
 
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	// 2. 校验关键字规则
+	if keyRule != "" {
+		if !strings.Contains(strings.ToLower(filename), strings.ToLower(keyRule)) {
+			return false
+		}
+	}
+
+	return true
 }
 
-// generateDestPath 检测同名冲突，防覆盖
-func generateDestPath(outDir, filename string) string {
-	dest := filepath.Join(outDir, filename)
-	if _, err := os.Stat(dest); os.IsNotExist(err) {
-		return dest
+// 物理流拷贝文件（改版：重名三位数递增探测逻辑）
+func copyFile(src, dst string) bool {
+	ext := filepath.Ext(dst)
+	base := strings.TrimSuffix(dst, ext)
+
+	// 增量计数器探测物理空位
+	counter := 1
+	for {
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			// 文件不存在，这个物理路径可用，跳出循环执行复制
+			break
+		}
+		// 文件存在，生成带三位格式化数字的新路径（例如 _001, _002）再进行下一轮探测
+		dst = fmt.Sprintf("%s_%03d%s", base, counter, ext)
+		counter++
 	}
-	// 冲突则在文件名后追加 Unix 纳秒时间戳
-	ext := filepath.Ext(filename)
-	base := strings.TrimSuffix(filename, ext)
-	newName := fmt.Sprintf("%s_%d%s", base, time.Now().UnixNano(), ext)
-	return filepath.Join(outDir, newName)
+
+	input, err := os.ReadFile(src)
+	if err != nil {
+		return false
+	}
+	err = os.WriteFile(dst, input, 0666)
+	return err == nil
+}
+
+// 阻塞等待回车
+func waitForRestart(scanner *bufio.Scanner) {
+	if scanner.Scan() {
+		// 仅作为阻塞，按下任意回车直接放行进入下一次主循环
+	}
 }
